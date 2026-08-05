@@ -16,3 +16,4 @@ venv/
 .omx/
 .omc/
 .worktrees/
+AGENTS.md
