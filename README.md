@@ -135,31 +135,12 @@ git clone https://github.com/ZSHYC/tennis-event-infer.git
 cd tennis-event-infer
 ```
 
-- `git clone <地址>`：把远程私有仓库复制到当前机器。执行账号必须已获得仓库读取权限；
-- `cd tennis-event-infer`：进入项目根目录。后续命令中的 `.` 都指这个目录。
-
-建议在独立 Python 环境中安装，避免污染系统 Python。例如：
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
-```
-
-- `python -m venv .venv`：在当前项目下创建名为 `.venv` 的虚拟环境；
-- `source .venv/bin/activate`：让当前终端后续使用这个环境中的 Python 和 pip。
-
 ### 2. 安装运行依赖
 
 ```bash
 python -m pip install .
 ```
-
-这条命令可以拆成四部分理解：
-
-- `python`：当前终端选中的 Python 解释器；
-- `-m pip`：用这个 Python 调用它对应的 pip，避免把包装进另一个 Python 环境；
-- `install`：执行安装；
-- `.`：安装当前目录。pip 会读取 [pyproject.toml](pyproject.toml)，安装运行依赖，并注册
+pip 会读取 [pyproject.toml](pyproject.toml)，安装运行依赖，并注册
   `tennis-event-infer` 命令。
 
 运行依赖只有 NumPy、OpenCV、PyTorch 和 torchvision。PyTorch 是否能够使用 CUDA，取决于当前环境
@@ -198,14 +179,7 @@ gh release download v1.0.0 \
   --pattern trajectory_patch_epoch10_threshold_010.pt \
   --dir models
 ```
-
-逐项解释：
-
-- `mkdir -p models`：创建 `models/`；目录已经存在时也不会报错；
-- `gh release download v1.0.0`：下载 `v1.0.0` Release 的附件；
-- `--repo ZSHYC/tennis-event-infer`：明确从哪个 GitHub 仓库下载；
-- `--pattern ...pt`：只下载名称完全匹配的 checkpoint；
-- `--dir models`：把文件放入当前项目的 `models/`。
+- 或者可以手动从github网页release处下载权重
 
 下载完成后必须校验 SHA-256：
 
@@ -213,13 +187,6 @@ gh release download v1.0.0 \
 echo "95a21b89f8991d955c2de5cc7fc8ed5ec2ac9698dd0a11965e421cde5367dce5  models/trajectory_patch_epoch10_threshold_010.pt" \
   | sha256sum -c -
 ```
-
-这条命令的含义是：
-
-1. `echo "<哈希>  <文件路径>"` 输出一行校验清单；哈希与路径之间是两个空格；
-2. `|` 把 `echo` 的标准输出传给右侧命令；
-3. `sha256sum -c` 按清单计算文件 SHA-256 并比较；
-4. 最后的 `-` 表示从标准输入读取清单，而不是从另一个文件读取。
 
 成功时必须看到：
 
