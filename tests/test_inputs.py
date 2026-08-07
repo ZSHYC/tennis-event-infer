@@ -16,8 +16,10 @@ from tennis_event_infer.types import TrajectoryFrame
 from tennis_event_infer.video import (
     PatchReader,
     crop_patch,
+    letterbox_image,
     locate_patch_center_arrays,
     nearest_frame_indices,
+    patch_valid_area_ratio,
     scan_video,
 )
 
@@ -220,17 +222,188 @@ def test_patch_locations_interpolate_only_within_time_gap():
     assert (x[3], y[3], quality[3]) == (6.0, 3.0, 1)
 
 
-def test_patch_reader_returns_five_online_patches_without_files(tmp_path):
+def _reference_sequences(path, frames, info, contract):
+    capture = cv2.VideoCapture(str(path))
+    images = []
+    while True:
+        readable, image = capture.read()
+        if not readable:
+            break
+        images.append(image)
+    capture.release()
+    x, y, quality, distance = locate_patch_center_arrays(
+        frames, max_gap_seconds=contract.max_gap_seconds, timeline=info.timeline
+    )
+    radius = max(1, int(round(contract.radius_ratio * min(info.width, info.height))))
+    expected = []
+    for center in range(len(frames)):
+        indices, valid = nearest_frame_indices(info.timeline, center=center, offsets=contract.offsets_seconds)
+        pixels = np.zeros((5, 3, contract.size[1], contract.size[0]), dtype=np.uint8)
+        mask = np.zeros(5, dtype=np.bool_)
+        qualities = np.zeros(5, dtype=np.int64)
+        continuous = np.zeros((5, 3), dtype=np.float32)
+        for output_index, source in enumerate(indices):
+            if not valid[output_index]:
+                continue
+            qualities[output_index] = quality[source]
+            if quality[source] == 0:
+                continue
+            center_xy = (float(x[source]), float(y[source]))
+            patch = crop_patch(images[source], center_xy, radius, contract.fill)
+            prepared = letterbox_image(patch, contract.size, contract.fill)
+            pixels[output_index] = np.moveaxis(prepared[..., ::-1], -1, 0)
+            mask[output_index] = True
+            continuous[output_index] = (
+                abs(float(info.timeline[source]) - source / info.fps),
+                float(distance[source]),
+                patch_valid_area_ratio(images[source].shape, center_xy, radius),
+            )
+        expected.append(
+            {
+                "patch_pixels": torch.from_numpy(pixels),
+                "patch_mask": torch.from_numpy(mask),
+                "patch_quality": torch.from_numpy(qualities),
+                "patch_quality_continuous": torch.from_numpy(continuous),
+            }
+        )
+    return expected
+
+
+def test_patch_reader_matches_reference_with_one_forward_decode(tmp_path):
     path = _video(tmp_path)
     before = {item.name for item in tmp_path.iterdir()}
     info = scan_video(path)
-    reader = PatchReader(path, _frames(), info.timeline, _patch_contract(), cache_size=5)
-    result = reader.sequence(3)
+    frames = _frames()
+    contract = _patch_contract()
+    expected = _reference_sequences(path, frames, info, contract)
+    reader = PatchReader(path, frames, info.timeline, contract, cache_size=5)
+    results = [reader.sequence(center) for center in range(len(frames))]
+    stats = reader.stats
     reader.close()
-    assert result["patch_pixels"].shape == (5, 3, 8, 8)
-    assert result["patch_pixels"].dtype == torch.uint8
-    assert result["patch_mask"].dtype == torch.bool
-    assert result["patch_quality"].dtype == torch.long
-    assert result["patch_quality_continuous"].dtype == torch.float32
-    assert result["patch_mask"].tolist() == [True] * 5
+    for result, reference in zip(results, expected):
+        for name in reference:
+            assert torch.equal(result[name], reference[name]), name
+    assert stats["video_open_count"] == 1
+    assert stats["decoded_frame_count"] <= len(frames)
     assert {item.name for item in tmp_path.iterdir()} == before
+
+
+def test_patch_reader_rejects_boolean_center(tmp_path):
+    path = _video(tmp_path)
+    info = scan_video(path)
+    reader = PatchReader(path, _frames(), info.timeline, _patch_contract(), cache_size=5)
+    with pytest.raises(ValueError, match="center=False"):
+        reader.sequence(False)
+    assert reader.stats["backward_request_count"] == 1
+    assert reader.stats["video_open_count"] == 0
+    reader.close()
+
+
+def test_patch_reader_duplicate_sources_use_one_cache_slot_and_release_at_end(tmp_path):
+    path = _video(tmp_path)
+    info = scan_video(path)
+    contract = _patch_contract()
+    contract.offsets_seconds = (0.0,) * 5
+    frames = _frames()
+    expected = _reference_sequences(path, frames, info, contract)
+    reader = PatchReader(path, frames, info.timeline, contract, cache_size=1)
+    results = [reader.sequence(center) for center in range(len(frames))]
+    for result, reference in zip(results, expected):
+        for name in reference:
+            assert torch.equal(result[name], reference[name]), name
+    assert reader.stats["peak_cached_patches"] == 1
+    assert reader.stats["decoded_frame_count"] == len(frames)
+    assert reader._patches == {}
+    reader.close()
+
+
+def test_patch_reader_preserves_boundary_and_missing_outputs(tmp_path):
+    path = _video(tmp_path)
+    info = scan_video(path)
+    frames = [
+        TrajectoryFrame(index, index in {0, 7}, 4.0 if index in {0, 7} else None, 3.0 if index in {0, 7} else None, 16, 8)
+        for index in range(8)
+    ]
+    contract = _patch_contract()
+    contract.max_gap_seconds = 0.01
+    expected = _reference_sequences(path, frames, info, contract)
+    reader = PatchReader(path, frames, info.timeline, contract, cache_size=2)
+    results = [reader.sequence(center) for center in range(len(frames))]
+    for result, reference in zip(results, expected):
+        for name in reference:
+            assert torch.equal(result[name], reference[name]), name
+    assert any(not result["patch_mask"].all() for result in results)
+    assert reader._patches == {}
+    reader.close()
+
+
+def test_patch_reader_rejects_insufficient_cache_before_decode(tmp_path, monkeypatch):
+    path = _video(tmp_path, count=16)
+    info = scan_video(path)
+    frames = _frames(16)
+    contract = _patch_contract()
+    real_capture = cv2.VideoCapture
+    reads = 0
+
+    class CountingCapture:
+        def __init__(self, source):
+            self.capture = real_capture(source)
+
+        def __getattr__(self, name):
+            return getattr(self.capture, name)
+
+        def read(self):
+            nonlocal reads
+            reads += 1
+            return self.capture.read()
+
+    monkeypatch.setattr(cv2, "VideoCapture", CountingCapture)
+    with pytest.raises(ValueError, match=r"峰值 .* cache_size=1.*尚未开始视频解码"):
+        PatchReader(path, frames, info.timeline, contract, cache_size=1)
+    assert reads == 0
+
+
+def test_patch_reader_rejects_out_of_order_without_reopening(tmp_path):
+    path = _video(tmp_path)
+    info = scan_video(path)
+    reader = PatchReader(path, _frames(), info.timeline, _patch_contract(), cache_size=5)
+    reader.sequence(0)
+    before = reader.stats
+    with pytest.raises(ValueError, match=r"center=0.*expected=1.*source="):
+        reader.sequence(0)
+    after = reader.stats
+    assert after["backward_request_count"] == before["backward_request_count"] + 1
+    assert after["video_open_count"] == before["video_open_count"] == 1
+    assert after["decoded_frame_count"] == before["decoded_frame_count"]
+    reader.close()
+
+
+def test_patch_reader_stats_are_copied(tmp_path):
+    path = _video(tmp_path)
+    info = scan_video(path)
+    reader = PatchReader(path, _frames(), info.timeline, _patch_contract(), cache_size=5)
+    stats = reader.stats
+    stats["video_open_count"] = 99
+    assert reader.stats["video_open_count"] == 0
+    reader.close()
+    assert reader.stats["video_open_count"] == 0
+
+
+def test_patch_reader_close_is_idempotent_after_release_error(tmp_path):
+    path = _video(tmp_path)
+    info = scan_video(path)
+    reader = PatchReader(path, _frames(), info.timeline, _patch_contract(), cache_size=5)
+    reader.sequence(0)
+    reader._capture.release()
+
+    class FailingCapture:
+        def release(self):
+            raise RuntimeError("release failed")
+
+    reader._capture = FailingCapture()
+    with pytest.raises(RuntimeError, match="release failed"):
+        reader.close()
+    assert reader._capture is None
+    assert reader._patches == {}
+    assert reader._remaining_references is None
+    reader.close()

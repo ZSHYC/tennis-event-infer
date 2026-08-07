@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections import OrderedDict
 from dataclasses import dataclass
 import math
 from pathlib import Path
@@ -234,19 +233,71 @@ class PatchReader:
             self.frames, max_gap_seconds=contract.max_gap_seconds, timeline=self.timeline
         )
         self.cache_size = cache_size
-        self._patches: OrderedDict[int, tuple[np.ndarray, float]] = OrderedDict()
+        self._indices, self._in_video = _nearest_frame_plan(self.timeline, self.offsets)
+        planned_sources = self._indices[self._in_video]
+        planned_sources = planned_sources[self.quality[planned_sources] != QUALITY_IDS["missing"]]
+        references = np.bincount(planned_sources, minlength=len(self.frames)).astype(np.int64, copy=False)
+        remaining = references.copy()
+        live: set[int] = set()
+        next_source = 0
+        peak = 0
+        for center in range(len(self.frames)):
+            selected = self._indices[center][
+                self._in_video[center]
+                & (self.quality[self._indices[center]] != QUALITY_IDS["missing"])
+            ]
+            if len(selected):
+                target = int(selected.max())
+                for source in range(next_source, target + 1):
+                    if remaining[source] > 0 and self.quality[source] != QUALITY_IDS["missing"]:
+                        live.add(source)
+                next_source = max(next_source, target + 1)
+                peak = max(peak, len(live))
+                for source in selected:
+                    remaining[source] -= 1
+                    if remaining[source] == 0:
+                        live.remove(int(source))
+        if peak > cache_size:
+            raise ValueError(f"顺序 patch 计划峰值 {peak} 超过 cache_size={cache_size}，尚未开始视频解码")
+
+        self._remaining_references: np.ndarray | None = references
+        self._patches: dict[int, tuple[np.ndarray, float]] = {}
         self._capture: cv2.VideoCapture | None = None
         self._next_frame = 0
+        self._next_center = 0
+        self._closed = False
+        self._stats = {
+            "video_open_count": 0,
+            "decoded_frame_count": 0,
+            "backward_request_count": 0,
+            "patch_cache_hits": 0,
+            "patch_cache_misses": 0,
+            "peak_cached_patches": 0,
+        }
+
+    @property
+    def stats(self) -> dict[str, int]:
+        return dict(self._stats)
 
     def sequence(self, center_frame: int) -> dict[str, torch.Tensor]:
-        indices, in_video = nearest_frame_indices(self.timeline, center=center_frame, offsets=self.offsets)
-        required = sorted(
-            int(index)
-            for index, valid in zip(indices, in_video)
-            if valid and self.quality[index] != QUALITY_IDS["missing"] and int(index) not in self._patches
-        )
-        for frame_number in required:
-            self._prepare(frame_number)
+        if self._closed:
+            raise ValueError("PatchReader 已关闭")
+        if not isinstance(center_frame, int) or isinstance(center_frame, bool) or center_frame != self._next_center:
+            in_range = isinstance(center_frame, int) and not isinstance(center_frame, bool) and 0 <= center_frame < len(self.frames)
+            source = int(self._indices[center_frame, 0]) if in_range else -1
+            self._stats["backward_request_count"] += 1
+            raise ValueError(f"中心帧必须严格递增: center={center_frame}, expected={self._next_center}, source={source}")
+        indices = self._indices[center_frame]
+        in_video = self._in_video[center_frame]
+        selected = indices[in_video & (self.quality[indices] != QUALITY_IDS["missing"])]
+        if len(selected):
+            target = int(selected.max())
+            missing = [int(source) for source in np.unique(selected) if int(source) not in self._patches]
+            if any(source < self._next_frame for source in missing):
+                source = next(source for source in missing if source < self._next_frame)
+                self._stats["backward_request_count"] += 1
+                raise RuntimeError(f"顺序解码遇到后退请求: center={center_frame}, source={source}")
+            self._decode_through(target)
 
         width, height = self.size
         pixels = np.zeros((len(indices), 3, height, width), dtype=np.uint8)
@@ -269,6 +320,11 @@ class PatchReader:
                 float(self.location_distance[frame_index]),
                 area,
             )
+        for frame_index in selected:
+            self._remaining_references[frame_index] -= 1
+            if self._remaining_references[frame_index] == 0:
+                self._patches.pop(int(frame_index))
+        self._next_center += 1
         return {
             "patch_pixels": torch.from_numpy(pixels),
             "patch_mask": torch.from_numpy(mask),
@@ -277,49 +333,65 @@ class PatchReader:
         }
 
     def close(self) -> None:
-        if self._capture is not None:
-            self._capture.release()
-            self._capture = None
+        if self._closed:
+            return
+        capture, self._capture = self._capture, None
+        self._closed = True
         self._patches.clear()
-        self._next_frame = 0
+        self._indices = None
+        self._in_video = None
+        self._remaining_references = None
+        if capture is not None:
+            capture.release()
 
     def _cached(self, frame_number: int) -> tuple[np.ndarray, float]:
         if frame_number not in self._patches:
-            self._prepare(frame_number)
-        self._patches.move_to_end(frame_number)
+            self._stats["backward_request_count"] += 1
+            raise RuntimeError(f"顺序 patch 缓存缺失: center={self._next_center}, source={frame_number}")
+        self._stats["patch_cache_hits"] += 1
         return self._patches[frame_number]
 
-    def _prepare(self, frame_number: int) -> None:
-        image = self._read_frame(frame_number)
+    def _prepare(self, frame_number: int, image: np.ndarray) -> None:
         center = (float(self.location_x[frame_number]), float(self.location_y[frame_number]))
         self._patches[frame_number] = (
             crop_patch(image, center, self.radius, self.fill),
             patch_valid_area_ratio(image.shape, center, self.radius),
         )
-        self._patches.move_to_end(frame_number)
-        if len(self._patches) > self.cache_size:
-            self._patches.popitem(last=False)
+        self._stats["patch_cache_misses"] += 1
+        self._stats["peak_cached_patches"] = max(self._stats["peak_cached_patches"], len(self._patches))
 
-    def _read_frame(self, frame_number: int) -> np.ndarray:
-        if self._capture is None or frame_number < self._next_frame:
-            if self._capture is not None:
-                self._capture.release()
+    def _decode_through(self, frame_number: int) -> None:
+        if self._capture is None:
             self._capture = cv2.VideoCapture(str(self.video))
             if not self._capture.isOpened():
                 raise ValueError(f"无法打开视频: {self.video}")
-            self._next_frame = 0
+            self._stats["video_open_count"] += 1
         while self._next_frame <= frame_number:
             readable, image = self._capture.read()
             if not readable:
                 raise ValueError(f"无法解码视频帧: {frame_number}")
             current = self._next_frame
             self._next_frame += 1
-            if current == frame_number:
-                _validate_image(image)
-                if image.shape[:2] != (self.height, self.width):
-                    raise ValueError(f"视频第 {frame_number} 帧分辨率不一致")
-                return image
-        raise RuntimeError("视频顺序解码状态无效")
+            self._stats["decoded_frame_count"] += 1
+            _validate_image(image)
+            if image.shape[:2] != (self.height, self.width):
+                raise ValueError(f"视频第 {current} 帧分辨率不一致")
+            if self._remaining_references[current] > 0 and self.quality[current] != QUALITY_IDS["missing"]:
+                self._prepare(current, image)
+
+
+def _nearest_frame_plan(timeline: np.ndarray, offsets: Sequence[float]) -> tuple[np.ndarray, np.ndarray]:
+    indices = np.zeros((len(timeline), len(offsets)), dtype=np.int64)
+    valid = np.zeros_like(indices, dtype=np.bool_)
+    for column, offset in enumerate(offsets):
+        targets = timeline + offset
+        valid[:, column] = (targets >= timeline[0]) & (targets <= timeline[-1])
+        selected = targets[valid[:, column]]
+        right = np.minimum(np.searchsorted(timeline, selected, side="left"), len(timeline) - 1)
+        left = np.maximum(right - 1, 0)
+        choose_left = selected - timeline[left] <= timeline[right] - selected + 1e-12
+        indices[valid[:, column], column] = np.where(choose_left, left, right)
+    return indices, valid
 
 
 def _timeline(values: Sequence[float] | np.ndarray, count: int | None = None) -> np.ndarray:
