@@ -237,6 +237,7 @@ events: 283
 elapsed_seconds: 3814.52
 events_json: /absolute/path/to/output/events.json
 events_csv: /absolute/path/to/output/events.csv
+inference_performance: {"backward_request_count": 0, "decoded_frame_count": 36325, "input_preparation_seconds": 46.95, "output_write_seconds": 0.01, "patch_cache_hits": 134450, "patch_cache_misses": 26894, "peak_cached_patches": 25, "pipeline_total_seconds": 270.83, "postprocess_seconds": 0.02, "scoring_seconds": 223.85, "video_open_count": 1}
 ```
 
 - `device`：实际使用的设备；
@@ -244,6 +245,12 @@ events_csv: /absolute/path/to/output/events.csv
 - `events`：阈值和 NMS 后保留的事件数；
 - `elapsed_seconds`：总耗时，单位为秒；
 - `events_json/events_csv`：两个正式输出文件的绝对路径。
+- `inference_performance`：可由程序解析的 JSON 性能摘要。`input_preparation_seconds` 是加载模型、CSV
+  和扫描视频时间轴的耗时；`scoring_seconds` 同时包含视频解码、patch 预处理和模型评分，不能理解成
+  纯 GPU 计算时间；`postprocess_seconds` 和 `output_write_seconds` 分别是 NMS 后处理和写文件耗时。
+  `video_open_count`、`decoded_frame_count` 与 `backward_request_count` 用于判断视频是否被反复打开、
+  重复解码或向后读取；`patch_cache_hits/misses` 是 patch 缓存命中/未命中次数，
+  `peak_cached_patches` 是内存中同时保留的 patch 峰值数量。
 
 上面的数字是命令输出格式示例；实际数值由输入视频、硬件和模型结果决定。
 
