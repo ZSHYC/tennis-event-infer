@@ -369,7 +369,9 @@ class PatchReader:
         while self._next_frame <= frame_number:
             readable, image = self._capture.read()
             if not readable:
-                raise ValueError(f"无法解码视频帧: {frame_number}")
+                raise ValueError(
+                    f"无法解码视频帧: current={self._next_frame}, source={self._next_frame}, target={frame_number}"
+                )
             current = self._next_frame
             self._next_frame += 1
             self._stats["decoded_frame_count"] += 1

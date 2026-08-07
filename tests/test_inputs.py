@@ -407,3 +407,33 @@ def test_patch_reader_close_is_idempotent_after_release_error(tmp_path):
     assert reader._patches == {}
     assert reader._remaining_references is None
     reader.close()
+
+
+def test_patch_reader_decode_error_reports_current_source_and_target(tmp_path, monkeypatch):
+    path = _video(tmp_path)
+    info = scan_video(path)
+    reader = PatchReader(path, _frames(), info.timeline, _patch_contract(), cache_size=5)
+
+    class UnreadableCapture:
+        def isOpened(self):
+            return True
+
+        def read(self):
+            return False, None
+
+        def release(self):
+            pass
+
+    monkeypatch.setattr(cv2, "VideoCapture", lambda _path: UnreadableCapture())
+    with pytest.raises(ValueError, match=r"current=0, source=0, target=2"):
+        reader.sequence(0)
+    reader.close()
+
+
+def test_patch_reader_sequence_after_close_has_stable_error(tmp_path):
+    path = _video(tmp_path)
+    info = scan_video(path)
+    reader = PatchReader(path, _frames(), info.timeline, _patch_contract(), cache_size=5)
+    reader.close()
+    with pytest.raises(ValueError, match=r"^PatchReader 已关闭$"):
+        reader.sequence(0)
