@@ -160,9 +160,11 @@ def predict_frame_scores(
                 for frame_number, probability in zip(batch["frame_number"].tolist(), probabilities.tolist()):
                     scores.append(FrameScore(int(frame_number), float(probability[0]), float(probability[1])))
     finally:
-        dataset.close()
-        if reader_stats is not None:
-            reader_stats.update(dataset.patch_reader.stats)
+        try:
+            dataset.close()
+        finally:
+            if reader_stats is not None:
+                reader_stats.update(dataset.patch_reader.stats)
     if len(scores) != len(frames):
         raise RuntimeError("模型分数没有逐帧覆盖视频")
     return scores

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import csv
-import inspect
 import json
 import os
 from pathlib import Path
@@ -152,9 +151,7 @@ def test_predict_frame_scores_runs_ordered_batches_without_workers(tmp_path):
     assert scores == [FrameScore(index, 0.25, 0.25) for index in range(8)]
 
 
-def test_predict_frame_scores_copies_reader_stats_after_close(monkeypatch):
-    assert "reader_stats" in inspect.signature(predict_frame_scores).parameters
-
+def test_predict_frame_scores_copies_reader_stats_when_close_fails(monkeypatch):
     class Reader:
         @property
         def stats(self):
@@ -167,6 +164,7 @@ def test_predict_frame_scores_copies_reader_stats_after_close(monkeypatch):
 
         def close(self):
             self.closed = True
+            raise RuntimeError("release failed")
 
     class Model(torch.nn.Module):
         def forward(self, **inputs):
@@ -186,15 +184,13 @@ def test_predict_frame_scores_copies_reader_stats_after_close(monkeypatch):
     monkeypatch.setattr(pipeline, "FrameDataset", lambda *args: dataset)
     monkeypatch.setattr(pipeline, "DataLoader", lambda *args, **kwargs: [batch])
 
-    scores = predict_frame_scores(None, _frames(1), None, loaded, batch_size=128, reader_stats=stats)
+    with pytest.raises(RuntimeError, match="release failed"):
+        predict_frame_scores(None, _frames(1), None, loaded, batch_size=128, reader_stats=stats)
 
-    assert scores == [FrameScore(0, 0.25, 0.25)]
     assert stats == {"decoded_frame_count": 7}
 
 
 def test_predict_frame_scores_closes_and_copies_stats_when_model_fails(monkeypatch):
-    assert "reader_stats" in inspect.signature(predict_frame_scores).parameters
-
     class Reader:
         @property
         def stats(self):
