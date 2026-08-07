@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 import time
 
@@ -36,6 +37,10 @@ def main() -> None:
     summary["elapsed_seconds"] = time.monotonic() - started
     for name in ("device", "frames", "events", "elapsed_seconds", "events_json", "events_csv"):
         print(f"{name}: {summary[name]}")
+    print(
+        "inference_performance: "
+        + json.dumps(summary["inference_performance"], sort_keys=True, allow_nan=False)
+    )
 
 
 if __name__ == "__main__":

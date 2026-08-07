@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import shutil
 import tempfile
+import time
 import uuid
 from typing import Mapping, Sequence
 
@@ -80,10 +81,16 @@ def run_inference(
     device: str,
     batch_size: int,
 ) -> dict[str, object]:
+    pipeline_started = time.perf_counter()
     loaded = load_checkpoint(checkpoint, device)
     frames = load_v5_csv(trajectory)
     video_info = scan_video(video)
-    scores = predict_frame_scores(video, frames, video_info, loaded, batch_size=batch_size)
+    input_preparation_finished = time.perf_counter()
+    reader_stats: dict[str, int] = {}
+    scores = predict_frame_scores(
+        video, frames, video_info, loaded, batch_size=batch_size, reader_stats=reader_stats,
+    )
+    scoring_finished = time.perf_counter()
     events = scores_to_events(
         scores,
         thresholds=loaded.postprocess.thresholds,
@@ -91,13 +98,23 @@ def run_inference(
         timeline=video_info.timeline,
         frames=frames,
     )
+    postprocess_finished = time.perf_counter()
     json_path, csv_path = write_events(events, output_dir)
+    output_write_finished = time.perf_counter()
     return {
         "device": str(loaded.device),
         "frames": len(frames),
         "events": len(events),
         "events_json": json_path.resolve(),
         "events_csv": csv_path.resolve(),
+        "inference_performance": {
+            "input_preparation_seconds": input_preparation_finished - pipeline_started,
+            "scoring_seconds": scoring_finished - input_preparation_finished,
+            "postprocess_seconds": postprocess_finished - scoring_finished,
+            "output_write_seconds": output_write_finished - postprocess_finished,
+            "pipeline_total_seconds": output_write_finished - pipeline_started,
+            **reader_stats,
+        },
     }
 
 
@@ -118,6 +135,7 @@ def predict_frame_scores(
     checkpoint: LoadedCheckpoint,
     *,
     batch_size: int,
+    reader_stats: dict[str, int] | None = None,
 ) -> list[FrameScore]:
     if not isinstance(batch_size, int) or isinstance(batch_size, bool) or batch_size <= 0:
         raise ValueError("batch_size 必须是正整数")
@@ -143,6 +161,8 @@ def predict_frame_scores(
                     scores.append(FrameScore(int(frame_number), float(probability[0]), float(probability[1])))
     finally:
         dataset.close()
+        if reader_stats is not None:
+            reader_stats.update(dataset.patch_reader.stats)
     if len(scores) != len(frames):
         raise RuntimeError("模型分数没有逐帧覆盖视频")
     return scores

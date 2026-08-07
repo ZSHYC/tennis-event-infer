@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import inspect
 import json
 import os
 from pathlib import Path
@@ -147,7 +148,173 @@ def test_predict_frame_scores_runs_ordered_batches_without_workers(tmp_path):
         ),
     )
     scores = predict_frame_scores(video, _frames(8, size=(16, 8)), scan_video(video), loaded, batch_size=3)
+    assert isinstance(scores, list)
     assert scores == [FrameScore(index, 0.25, 0.25) for index in range(8)]
+
+
+def test_predict_frame_scores_copies_reader_stats_after_close(monkeypatch):
+    assert "reader_stats" in inspect.signature(predict_frame_scores).parameters
+
+    class Reader:
+        @property
+        def stats(self):
+            assert dataset.closed
+            return {"decoded_frame_count": 7}
+
+    class Dataset:
+        patch_reader = Reader()
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    class Model(torch.nn.Module):
+        def forward(self, **inputs):
+            return {"eventness_logit": torch.zeros(1), "type_logits": torch.zeros(1, 2)}
+
+    dataset = Dataset()
+    batch = {
+        "frame_number": torch.tensor([0]),
+        "trajectory": torch.zeros(1, 1, 11),
+        "patch_pixels": torch.zeros(1, 5, 3, 8, 8, dtype=torch.uint8),
+        "patch_mask": torch.ones(1, 5, dtype=torch.bool),
+        "patch_quality": torch.ones(1, 5, dtype=torch.long),
+        "patch_quality_continuous": torch.zeros(1, 5, 3),
+    }
+    loaded = SimpleNamespace(model=Model(), device=torch.device("cpu"))
+    stats = {}
+    monkeypatch.setattr(pipeline, "FrameDataset", lambda *args: dataset)
+    monkeypatch.setattr(pipeline, "DataLoader", lambda *args, **kwargs: [batch])
+
+    scores = predict_frame_scores(None, _frames(1), None, loaded, batch_size=128, reader_stats=stats)
+
+    assert scores == [FrameScore(0, 0.25, 0.25)]
+    assert stats == {"decoded_frame_count": 7}
+
+
+def test_predict_frame_scores_closes_and_copies_stats_when_model_fails(monkeypatch):
+    assert "reader_stats" in inspect.signature(predict_frame_scores).parameters
+
+    class Reader:
+        @property
+        def stats(self):
+            assert dataset.closed
+            return {"decoded_frame_count": 1}
+
+    class Dataset:
+        patch_reader = Reader()
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    class Model(torch.nn.Module):
+        def forward(self, **inputs):
+            raise RuntimeError("model failed")
+
+    dataset = Dataset()
+    batch = {
+        "frame_number": torch.tensor([0]),
+        **{name: torch.zeros(1) for name in pipeline._MODEL_INPUTS},
+    }
+    loaded = SimpleNamespace(model=Model(), device=torch.device("cpu"))
+    stats = {}
+    monkeypatch.setattr(pipeline, "FrameDataset", lambda *args: dataset)
+    monkeypatch.setattr(pipeline, "DataLoader", lambda *args, **kwargs: [batch])
+
+    with pytest.raises(RuntimeError, match="model failed"):
+        predict_frame_scores(None, _frames(1), None, loaded, batch_size=128, reader_stats=stats)
+
+    assert dataset.closed is True
+    assert stats == {"decoded_frame_count": 1}
+
+
+def test_run_inference_reports_phase_timings_and_reader_stats_without_new_files(tmp_path, monkeypatch):
+    frames = _frames(1)
+    video_info = SimpleNamespace(timeline=np.array([0.0]))
+    loaded = SimpleNamespace(
+        device=torch.device("cpu"),
+        postprocess=SimpleNamespace(thresholds={"hit": 0.5, "bounce": 0.5}, nms_radius=1),
+    )
+    reader_stats = {
+        "video_open_count": 1,
+        "decoded_frame_count": 1,
+        "backward_request_count": 0,
+        "patch_cache_hits": 2,
+        "patch_cache_misses": 1,
+        "peak_cached_patches": 1,
+    }
+    monkeypatch.setattr(pipeline, "load_checkpoint", lambda *args: loaded)
+    monkeypatch.setattr(pipeline, "load_v5_csv", lambda *args: frames)
+    monkeypatch.setattr(pipeline, "scan_video", lambda *args: video_info)
+
+    def predict(*args, batch_size, reader_stats=None):
+        assert batch_size == 128
+        assert reader_stats is not None
+        reader_stats.update(reader_stats_fixture)
+        return [FrameScore(0, 0.25, 0.25)]
+
+    reader_stats_fixture = reader_stats
+    monkeypatch.setattr(pipeline, "predict_frame_scores", predict)
+    monkeypatch.setattr("time.perf_counter", lambda: next(clock))
+    clock = iter((10.0, 11.0, 13.0, 16.0, 20.0))
+    output = tmp_path / "events"
+
+    summary = pipeline.run_inference(
+        video="video", trajectory="track.csv", checkpoint="model.pt", output_dir=output,
+        device="cpu", batch_size=128,
+    )
+
+    assert set(summary) == {"device", "frames", "events", "events_json", "events_csv", "inference_performance"}
+    assert {path.name for path in output.iterdir()} == {"events.json", "events.csv"}
+    assert summary["inference_performance"] == {
+        "input_preparation_seconds": 1.0,
+        "scoring_seconds": 2.0,
+        "postprocess_seconds": 3.0,
+        "output_write_seconds": 4.0,
+        "pipeline_total_seconds": 10.0,
+        **reader_stats,
+    }
+
+
+@pytest.mark.parametrize(("batch_args", "expected"), [((), 128), (("--batch-size", "17"), 17)])
+def test_cli_forwards_batch_size_and_prints_parseable_performance_json(
+    tmp_path, monkeypatch, capsys, batch_args, expected,
+):
+    import tennis_event_infer.cli as cli
+
+    received = {}
+    performance = {"pipeline_total_seconds": 1.25, "decoded_frame_count": 3}
+
+    def run(**kwargs):
+        received.update(kwargs)
+        return {
+            "device": "cpu",
+            "frames": 1,
+            "events": 0,
+            "events_json": tmp_path / "events.json",
+            "events_csv": tmp_path / "events.csv",
+            "inference_performance": performance,
+        }
+
+    monkeypatch.setattr(cli, "run_inference", run)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["tennis-event-infer", "--video", "video", "--trajectory", "track.csv", "--checkpoint", "model.pt",
+         "--output-dir", str(tmp_path), *batch_args],
+    )
+
+    cli.main()
+
+    assert received["batch_size"] == expected
+    lines = [
+        line for line in capsys.readouterr().out.splitlines()
+        if line.startswith("inference_performance: ")
+    ]
+    assert len(lines) == 1
+    line = lines[0]
+    assert json.loads(line.removeprefix("inference_performance: ")) == performance
 
 
 def _cli_command(*args: str):
