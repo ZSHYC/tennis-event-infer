@@ -69,6 +69,28 @@ def test_prefetch_one_propagates_producer_failure():
         next(iterator)
 
 
+@pytest.mark.parametrize("count", [1, 3])
+def test_collate_pinned_preserves_tensor_contract_and_frame_order(count):
+    samples = [
+        {
+            "frame_number": index,
+            "trajectory": torch.full((2, 11), index, dtype=torch.float32),
+            "patch_pixels": torch.full((5, 3, 4, 4), index, dtype=torch.uint8),
+            "patch_mask": torch.full((5,), bool(index % 2), dtype=torch.bool),
+            "patch_quality": torch.full((5,), index, dtype=torch.int64),
+            "patch_quality_continuous": torch.full((5, 3), index, dtype=torch.float32),
+        }
+        for index in range(count)
+    ]
+
+    batch = pipeline._collate_pinned(samples)
+
+    assert batch["frame_number"].tolist() == list(range(count))
+    for name, value in batch.items():
+        assert value.is_pinned(), name
+        torch.testing.assert_close(value, torch.stack([torch.as_tensor(sample[name]) for sample in samples]))
+
+
 def test_nms_is_per_class_and_prefers_higher_score():
     scores = [
         FrameScore(10, hit=0.7, bounce=0.1),

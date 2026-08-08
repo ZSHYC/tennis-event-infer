@@ -47,6 +47,17 @@ def _prefetch_one(iterable):
         executor.shutdown(wait=True, cancel_futures=True)
 
 
+def _collate_pinned(batch: list[dict[str, torch.Tensor | int]]) -> dict[str, torch.Tensor]:
+    output = {}
+    for name in batch[0]:
+        values = [torch.as_tensor(sample[name]) for sample in batch]
+        destination = torch.empty(
+            (len(values), *values[0].shape), dtype=values[0].dtype, pin_memory=True
+        )
+        output[name] = torch.stack(values, out=destination)
+    return output
+
+
 @dataclass(frozen=True)
 class FrameScore:
     frame_number: int
@@ -160,7 +171,8 @@ def predict_frame_scores(
         batch_size=batch_size,
         shuffle=False,
         num_workers=0,
-        pin_memory=checkpoint.device.type == "cuda",
+        pin_memory=False,
+        collate_fn=_collate_pinned if checkpoint.device.type == "cuda" else None,
     )
     scores: list[FrameScore] = []
     try:
