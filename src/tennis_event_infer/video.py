@@ -311,9 +311,8 @@ class PatchReader:
             quality[output_index] = quality_id
             if quality_id == QUALITY_IDS["missing"]:
                 continue
-            patch, area = self._cached(int(frame_index))
-            prepared = letterbox_image(patch, self.size, self.fill)
-            pixels[output_index] = np.moveaxis(prepared[..., ::-1], -1, 0)
+            prepared, area = self._cached(int(frame_index))
+            pixels[output_index] = prepared
             mask[output_index] = True
             continuous[output_index] = (
                 abs(float(self.timeline[frame_index]) - frame_index / self.fps),
@@ -353,8 +352,10 @@ class PatchReader:
 
     def _prepare(self, frame_number: int, image: np.ndarray) -> None:
         center = (float(self.location_x[frame_number]), float(self.location_y[frame_number]))
+        patch = crop_patch(image, center, self.radius, self.fill)
+        prepared = letterbox_image(patch, self.size, self.fill)
         self._patches[frame_number] = (
-            crop_patch(image, center, self.radius, self.fill),
+            np.moveaxis(prepared[..., ::-1], -1, 0).copy(),
             patch_valid_area_ratio(image.shape, center, self.radius),
         )
         self._stats["patch_cache_misses"] += 1

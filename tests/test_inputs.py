@@ -6,6 +6,7 @@ import pytest
 import torch
 from types import SimpleNamespace
 
+import tennis_event_infer.video as video_module
 from tennis_event_infer.trajectory import (
     FEATURE_NAMES,
     FeatureNormalizer,
@@ -314,6 +315,28 @@ def test_patch_reader_duplicate_sources_use_one_cache_slot_and_release_at_end(tm
     assert reader.stats["peak_cached_patches"] == 1
     assert reader.stats["decoded_frame_count"] == len(frames)
     assert reader._patches == {}
+    reader.close()
+
+
+def test_patch_reader_prepares_each_source_patch_once(tmp_path, monkeypatch):
+    path = _video(tmp_path)
+    info = scan_video(path)
+    contract = _patch_contract()
+    contract.offsets_seconds = (0.0,) * 5
+    calls = []
+    real_letterbox = video_module.letterbox_image
+
+    def count_letterbox(*args, **kwargs):
+        calls.append(None)
+        return real_letterbox(*args, **kwargs)
+
+    monkeypatch.setattr(video_module, "letterbox_image", count_letterbox)
+    reader = PatchReader(path, _frames(), info.timeline, contract, cache_size=1)
+
+    for center in range(len(_frames())):
+        reader.sequence(center)
+
+    assert len(calls) == len(_frames())
     reader.close()
 
 
