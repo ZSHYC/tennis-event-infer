@@ -47,8 +47,10 @@ patch，图像骨干为 ResNet-18，训练时微调 layer4。仓库只包含生�
 - FPS；
 - 每一帧的时间戳。
 
-程序优先使用视频解码器报告的逐帧 PTS 作为时间轴。只有当 PTS 不可用或不是严格递增时，才使用
-`frame_number / FPS` 作为时间戳回退。因此不要用 CSV 中的 FPS 或自行估算的时间戳替代视频时间轴。
+OpenCV 使用 FFmpeg 后端时，程序优先通过 `ffprobe` 读取视频 packet 的整数 PTS；读取结果通过数量、
+time base、非负整数和严格递增校验后才会使用。`ffprobe` 缺失、执行失败或结果无效时，程序自动回退到
+OpenCV 逐帧扫描。只有解码器 PTS 不可用或不是严格递增时，才使用 `frame_number / FPS` 作为时间戳
+回退。因此不要用 CSV 中的 FPS 或自行估算的时间戳替代视频时间轴。
 
 生产推理面对的是没有 GT 的新视频，所以输入必须覆盖完整视频；不能只截取某段 GT 范围。
 
@@ -137,8 +139,8 @@ cd tennis-event-infer
 
 ### 2. 安装 FFmpeg/ffprobe 系统依赖
 
-下一阶段时间轴性能快路径将使用 `ffprobe` 快速读取逐帧 packet PTS，避免 OpenCV 为获取时间轴额外遍历
-整段视频。`ffprobe` 随 FFmpeg 一起发布，不是独立的 pip 包，`python -m pip install .` 不会安装它。
+当前代码使用 `ffprobe` 快速读取逐帧 packet PTS，避免 OpenCV 为获取时间轴额外遍历整段视频。
+`ffprobe` 随 FFmpeg 一起发布，不是独立的 pip 包，`python -m pip install .` 不会安装它。
 
 Ubuntu、Debian 或 WSL 优先通过系统包管理器安装：
 
@@ -163,9 +165,8 @@ ffprobe -version
 ```
 
 四条命令都应成功。性能探针已在 FFmpeg/ffprobe 4.4.2 上验证；建议使用 4.4 或更高版本。生产部署发现
-命令缺失时，应先完成安装再执行推理。快路径合入后仍会保留 OpenCV 时间轴扫描，作为受限环境或特殊视频
-不满足 packet PTS 合同时的正确性回退；该回退会使当前正式长视频增加约 45 秒输入准备时间，不应作为常规
-生产配置。快路径合入前，当前代码仍使用 OpenCV 扫描。
+命令缺失时，应先完成安装再执行推理。程序仍保留 OpenCV 时间轴扫描，作为受限环境或特殊视频不满足
+packet PTS 合同时的正确性回退；该回退会使当前正式长视频增加约 45 秒输入准备时间，不应作为常规生产配置。
 
 ### 3. 安装 Python 运行依赖
 
@@ -267,10 +268,10 @@ tennis-event-infer \
 device: cuda
 frames: 36325
 events: 283
-elapsed_seconds: 3814.52
+elapsed_seconds: 107.23
 events_json: /absolute/path/to/output/events.json
 events_csv: /absolute/path/to/output/events.csv
-inference_performance: {"backward_request_count": 0, "decoded_frame_count": 36325, "input_preparation_seconds": 46.95, "output_write_seconds": 0.01, "patch_cache_hits": 134450, "patch_cache_misses": 26894, "peak_cached_patches": 25, "pipeline_total_seconds": 270.83, "postprocess_seconds": 0.02, "scoring_seconds": 223.85, "video_open_count": 1}
+inference_performance: {"backward_request_count": 0, "decoded_frame_count": 36325, "input_preparation_seconds": 1.23, "output_write_seconds": 0.01, "patch_cache_hits": 134450, "patch_cache_misses": 26894, "peak_cached_patches": 25, "pipeline_total_seconds": 107.23, "postprocess_seconds": 0.02, "scoring_seconds": 105.96, "video_open_count": 1}
 ```
 
 - `device`：实际使用的设备；
@@ -278,9 +279,10 @@ inference_performance: {"backward_request_count": 0, "decoded_frame_count": 3632
 - `events`：阈值和 NMS 后保留的事件数；
 - `elapsed_seconds`：总耗时，单位为秒；
 - `events_json/events_csv`：两个正式输出文件的绝对路径。
-- `inference_performance`：可由程序解析的 JSON 性能摘要。`input_preparation_seconds` 是加载模型、CSV
-  和扫描视频时间轴的耗时；`scoring_seconds` 同时包含视频解码、patch 预处理和模型评分，不能理解成
-  纯 GPU 计算时间；`postprocess_seconds` 和 `output_write_seconds` 分别是 NMS 后处理和写文件耗时。
+- `inference_performance`：可由程序解析的 JSON 性能摘要。`input_preparation_seconds` 是加载模型、CSV，
+  以及通过 `ffprobe` 快路径或 OpenCV 回退取得并校验视频时间轴的耗时；`scoring_seconds` 同时包含
+  视频解码、patch 预处理和模型评分，不能理解成纯 GPU 计算时间；`postprocess_seconds` 和
+  `output_write_seconds` 分别是 NMS 后处理和写文件耗时。
   `video_open_count`、`decoded_frame_count` 与 `backward_request_count` 用于判断视频是否被反复打开、
   重复解码或向后读取；`patch_cache_hits/misses` 是 patch 缓存命中/未命中次数，
   `peak_cached_patches` 是内存中同时保留的 patch 峰值数量。
@@ -396,7 +398,7 @@ python -m pip install '.[dev]'
 ```bash
 pytest -q
 ruff check src tests
-python -m compileall -q src
+python -m compileall -q src tests
 python -m pip check
 ffmpeg -version
 ffprobe -version
@@ -405,7 +407,7 @@ tennis-event-infer --help
 
 - `pytest -q`：运行生产输入、checkpoint 和短视频端到端测试；`-q` 表示精简输出；
 - `ruff check src tests`：检查源码和测试中的语法、未定义名称及选定规范问题；
-- `python -m compileall -q src`：把源码编译为 Python 字节码，用于发现语法错误；
+- `python -m compileall -q src tests`：把源码和测试编译为 Python 字节码，用于发现语法错误；
 - `python -m pip check`：检查已安装依赖是否存在版本冲突或缺失；
 - `ffmpeg/ffprobe -version`：确认时间轴快路径的系统依赖已安装且当前 shell 可执行；
 - `tennis-event-infer --help`：确认安装后的命令入口和参数合同可用。
@@ -419,8 +421,8 @@ tennis-event-infer --help
 - checkpoint SHA-256：
   `95a21b89f8991d955c2de5cc7fc8ed5ec2ac9698dd0a11965e421cde5367dce5`；
 - 当前 checkpoint 的 hit/bounce 阈值均为 `0.10`，NMS 半径为 5 帧；
-- 已在 NVIDIA GeForce RTX 5070 Ti Laptop GPU 上完成 36,325 帧完整视频推理，batch size 128，
-  耗时约 63.6 分钟。
+- 已在 NVIDIA GeForce RTX 5070 Ti Laptop GPU 上完成 36,325 帧完整视频推理，batch size 128；三次正式
+  运行总耗时中位数约 `107.23` 秒（约 1.8 分钟），其中输入准备约 `1.23` 秒、评分约 `105.96` 秒。
 
 上述耗时只证明当前链路完成过全视频验证，不是其他机器的性能保证。实际速度取决于视频编码与
 分辨率、磁盘解码速度、CPU、GPU、PyTorch/CUDA 环境和 batch size。
