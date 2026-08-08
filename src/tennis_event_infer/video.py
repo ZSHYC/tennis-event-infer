@@ -426,23 +426,10 @@ class PatchReader:
 
     def _prepare(self, frame_number: int, image: np.ndarray) -> None:
         center = (float(self.location_x[frame_number]), float(self.location_y[frame_number]))
-        left, top, source_left, source_top, source_right, source_bottom = _crop_bounds(
-            center, self.radius, image.shape[1], image.shape[0]
-        )
-        inside = (
-            source_left == left
-            and source_top == top
-            and source_right == left + 2 * self.radius
-            and source_bottom == top + 2 * self.radius
-        )
-        patch = (
-            image[source_top:source_bottom, source_left:source_right]
-            if inside
-            else crop_patch(image, center, self.radius, self.fill)
-        )
+        patch = crop_patch(image, center, self.radius, self.fill)
         prepared = letterbox_image(patch, self.size, self.fill)
         self._patches[frame_number] = (
-            np.stack(cv2.split(prepared)[::-1]),
+            np.moveaxis(prepared[..., ::-1], -1, 0).copy(),
             patch_valid_area_ratio(image.shape, center, self.radius),
         )
         self._stats["patch_cache_misses"] += 1

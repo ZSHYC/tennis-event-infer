@@ -296,65 +296,6 @@ def test_crop_patch_fills_outside_image():
     assert tuple(patch[2, 2]) == (0, 0, 0)
 
 
-def _prepare_only_reader(*, center, radius=2, size=(4, 4)):
-    reader = object.__new__(PatchReader)
-    reader.location_x = np.asarray([center[0]], dtype=np.float32)
-    reader.location_y = np.asarray([center[1]], dtype=np.float32)
-    reader.radius = radius
-    reader.fill = (114, 114, 114)
-    reader.size = size
-    reader._patches = {}
-    reader._stats = {"patch_cache_misses": 0, "peak_cached_patches": 0}
-    return reader
-
-
-def test_patch_reader_prepare_uses_view_for_fully_inside_patch(monkeypatch):
-    image = np.arange(8 * 8 * 3, dtype=np.uint8).reshape(8, 8, 3)
-    center, radius = (4.0, 4.0), 2
-    expected_patch = crop_patch(image, center, radius, (114, 114, 114))
-    expected = np.moveaxis(
-        letterbox_image(expected_patch, (4, 4), (114, 114, 114))[..., ::-1], -1, 0
-    ).copy()
-    reader = _prepare_only_reader(center=center, radius=radius)
-    monkeypatch.setattr(
-        video_module,
-        "crop_patch",
-        lambda *args, **kwargs: pytest.fail("fully inside must not copy"),
-    )
-
-    reader._prepare(0, image)
-
-    actual, area = reader._patches[0]
-    np.testing.assert_array_equal(actual, expected)
-    assert actual.dtype == np.uint8 and actual.shape == (3, 4, 4)
-    assert area == 1.0
-
-
-def test_patch_reader_prepare_keeps_boundary_fill_semantics(monkeypatch):
-    image = np.arange(8 * 8 * 3, dtype=np.uint8).reshape(8, 8, 3)
-    center, radius = (0.0, 0.0), 2
-    expected_patch = crop_patch(image, center, radius, (114, 114, 114))
-    expected = np.moveaxis(
-        letterbox_image(expected_patch, (4, 4), (114, 114, 114))[..., ::-1], -1, 0
-    ).copy()
-    calls = 0
-    real_crop = crop_patch
-
-    def counted_crop(*args, **kwargs):
-        nonlocal calls
-        calls += 1
-        return real_crop(*args, **kwargs)
-
-    reader = _prepare_only_reader(center=center, radius=radius)
-    monkeypatch.setattr(video_module, "crop_patch", counted_crop)
-
-    reader._prepare(0, image)
-
-    np.testing.assert_array_equal(reader._patches[0][0], expected)
-    assert calls == 1
-    assert reader.stats == {"patch_cache_misses": 1, "peak_cached_patches": 1}
-
-
 def test_patch_locations_interpolate_only_within_time_gap():
     frames = [
         TrajectoryFrame(0, True, 2.0, 3.0, 16, 8),
