@@ -135,7 +135,39 @@ git clone https://github.com/ZSHYC/tennis-event-infer.git
 cd tennis-event-infer
 ```
 
-### 2. 安装运行依赖
+### 2. 安装 FFmpeg/ffprobe 系统依赖
+
+下一阶段时间轴性能快路径将使用 `ffprobe` 快速读取逐帧 packet PTS，避免 OpenCV 为获取时间轴额外遍历
+整段视频。`ffprobe` 随 FFmpeg 一起发布，不是独立的 pip 包，`python -m pip install .` 不会安装它。
+
+Ubuntu、Debian 或 WSL 优先通过系统包管理器安装：
+
+```bash
+sudo apt-get update
+sudo apt-get install -y ffmpeg
+```
+
+没有 sudo 权限但可以使用 conda 时，安装到当前环境：
+
+```bash
+conda install -c conda-forge ffmpeg -y
+```
+
+安装后必须确认 `ffmpeg` 和 `ffprobe` 都能被当前 shell 找到：
+
+```bash
+command -v ffmpeg
+command -v ffprobe
+ffmpeg -version
+ffprobe -version
+```
+
+四条命令都应成功。性能探针已在 FFmpeg/ffprobe 4.4.2 上验证；建议使用 4.4 或更高版本。生产部署发现
+命令缺失时，应先完成安装再执行推理。快路径合入后仍会保留 OpenCV 时间轴扫描，作为受限环境或特殊视频
+不满足 packet PTS 合同时的正确性回退；该回退会使当前正式长视频增加约 45 秒输入准备时间，不应作为常规
+生产配置。快路径合入前，当前代码仍使用 OpenCV 扫描。
+
+### 3. 安装 Python 运行依赖
 
 ```bash
 python -m pip install .
@@ -144,9 +176,10 @@ pip 会读取 [pyproject.toml](pyproject.toml)，安装运行依赖，并注册
   `tennis-event-infer` 命令。
 
 运行依赖只有 NumPy、OpenCV、PyTorch 和 torchvision。PyTorch 是否能够使用 CUDA，取决于当前环境
-安装的 PyTorch 构建和 NVIDIA 驱动，不由本项目静默切换。
+安装的 PyTorch 构建和 NVIDIA 驱动，不由本项目静默切换。这里列出的是 Python 依赖；FFmpeg/ffprobe
+属于上一步单独安装和验证的系统依赖。
 
-### 3. 可选：安装开发验证依赖
+### 4. 可选：安装开发验证依赖
 
 ```bash
 python -m pip install '.[dev]'
@@ -333,6 +366,7 @@ frame_number,timestamp_seconds,event_type,confidence,x,y
 | --- | --- | --- |
 | `Repository not found` | 没有私有仓库权限，或 GitHub 账号未登录 | 确认已被邀请，并检查 `gh auth status` |
 | `release not found` | 版本名或仓库名错误 | 使用 `v1.0.0` 和 `ZSHYC/tennis-event-infer` |
+| 找不到 `ffprobe` 或未启用 PTS 快路径 | 系统未安装 FFmpeg，或当前 shell 的 `PATH` 不包含安装目录 | 优先按安装章节安装 FFmpeg，再运行 `command -v ffprobe` 和 `ffprobe -version` |
 | SHA-256 显示 `FAILED` | 下载不完整、文件损坏或拿错模型 | 删除该文件后重新下载，校验通过再运行 |
 | `V5 CSV 缺少字段` | CSV 表头缺少六个必需列 | 按输入合同补齐准确列名 |
 | `V5 CSV 必须逐帧覆盖 0..N-1` | 删除了漏检帧、帧号跳跃/重复/乱序 | 为每个视频帧保留一行，漏检写 `detected=0` |
@@ -364,6 +398,8 @@ pytest -q
 ruff check src tests
 python -m compileall -q src
 python -m pip check
+ffmpeg -version
+ffprobe -version
 tennis-event-infer --help
 ```
 
@@ -371,6 +407,7 @@ tennis-event-infer --help
 - `ruff check src tests`：检查源码和测试中的语法、未定义名称及选定规范问题；
 - `python -m compileall -q src`：把源码编译为 Python 字节码，用于发现语法错误；
 - `python -m pip check`：检查已安装依赖是否存在版本冲突或缺失；
+- `ffmpeg/ffprobe -version`：确认时间轴快路径的系统依赖已安装且当前 shell 可执行；
 - `tennis-event-infer --help`：确认安装后的命令入口和参数合同可用。
 
 ## 当前版本与实测信息
