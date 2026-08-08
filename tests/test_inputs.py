@@ -193,6 +193,94 @@ def test_scan_video_and_patch_reader_validate_complete_alignment(tmp_path):
         PatchReader(path, wrong_size, info.timeline, _patch_contract())
 
 
+def test_packet_timeline_sorts_pts_and_matches_opencv_float_order():
+    payload = {
+        "packets": [{"pts": 220}, {"pts": 0}, {"pts": 100}],
+        "streams": [{"time_base": "1/600"}],
+    }
+
+    timeline = video_module._packet_timeline(payload, expected_count=3)
+
+    assert timeline.dtype == np.float64
+    assert timeline.tolist() == [0.0, 0.16666666666666669, 0.3666666666666667]
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_count"),
+    [
+        ({"packets": [{"pts": 0}], "streams": [{"time_base": "0/1"}]}, 1),
+        ({"packets": [{"pts": 0}, {"pts": 0}], "streams": [{"time_base": "1/10"}]}, 2),
+        ({"packets": [{}], "streams": [{"time_base": "1/10"}]}, 1),
+        ({"packets": [{"pts": -1}], "streams": [{"time_base": "1/10"}]}, 1),
+        ({"packets": [{"pts": "0"}], "streams": [{"time_base": "1/10"}]}, 1),
+        ({"packets": [{"pts": 0}], "streams": [{"time_base": "1/10"}]}, 2),
+    ],
+)
+def test_packet_timeline_rejects_invalid_probe_data(payload, expected_count):
+    with pytest.raises(ValueError):
+        video_module._packet_timeline(payload, expected_count=expected_count)
+
+
+def test_scan_video_uses_packet_timeline_without_grabbing_frames(tmp_path, monkeypatch):
+    path = _video(tmp_path)
+    real_capture = cv2.VideoCapture
+    grabs = 0
+
+    class CountingCapture:
+        def __init__(self, source):
+            self.capture = real_capture(source)
+
+        def __getattr__(self, name):
+            return getattr(self.capture, name)
+
+        def grab(self):
+            nonlocal grabs
+            grabs += 1
+            return self.capture.grab()
+
+    timeline = np.arange(8, dtype=np.float64) / 10
+    monkeypatch.setattr(cv2, "VideoCapture", CountingCapture)
+    monkeypatch.setattr(video_module, "_ffprobe_timeline", lambda _video, _count: timeline)
+
+    info = scan_video(path)
+
+    assert grabs == 0
+    assert info.timestamp_source == "pts"
+    np.testing.assert_array_equal(info.timeline, timeline)
+
+
+def test_scan_video_falls_back_when_packet_timeline_is_unavailable(tmp_path, monkeypatch):
+    path = _video(tmp_path)
+    monkeypatch.setattr(video_module, "_ffprobe_timeline", lambda _video, _count: None)
+
+    info = scan_video(path)
+
+    assert info.frame_count == 8
+    assert info.timestamp_source in {"pts", "fps_fallback"}
+    assert np.all(np.diff(info.timeline) > 0)
+
+
+def test_ffprobe_timeline_missing_binary_reports_install_command(tmp_path, monkeypatch, caplog):
+    monkeypatch.setattr(video_module.shutil, "which", lambda _name: None)
+
+    assert video_module._ffprobe_timeline(tmp_path / "video.mov", 1) is None
+    assert "sudo apt-get install -y ffmpeg" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        video_module.subprocess.TimeoutExpired("ffprobe", 30),
+        video_module.subprocess.CalledProcessError(1, ["ffprobe"]),
+    ],
+)
+def test_ffprobe_timeline_command_failure_returns_none(tmp_path, monkeypatch, error):
+    monkeypatch.setattr(video_module.shutil, "which", lambda _name: "/usr/bin/ffprobe")
+    monkeypatch.setattr(video_module.subprocess, "run", lambda *args, **kwargs: (_ for _ in ()).throw(error))
+
+    assert video_module._ffprobe_timeline(tmp_path / "video.mov", 1) is None
+
+
 def test_nearest_frame_breaks_ties_to_earlier_frame():
     times = np.array([0.0, 0.1, 0.2], dtype=np.float64)
     indices, valid = nearest_frame_indices(times, center=1, offsets=(-0.05, 0.05))

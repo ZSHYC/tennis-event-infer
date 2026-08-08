@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from fractions import Fraction
+import json
+import logging
 import math
 from pathlib import Path
+import shutil
+import subprocess
 from typing import TYPE_CHECKING, Sequence
 
 import cv2
@@ -16,6 +21,7 @@ if TYPE_CHECKING:
 
 
 QUALITY_IDS = {"missing": 0, "nearest": 1, "interpolated": 2, "observed": 3}
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -26,6 +32,66 @@ class VideoInfo:
     width: int
     height: int
     frame_count: int
+
+
+def _packet_timeline(payload: object, expected_count: int) -> np.ndarray:
+    if not isinstance(payload, dict):
+        raise ValueError("ffprobe 输出必须是 JSON 对象")
+    streams = payload.get("streams")
+    packets = payload.get("packets")
+    if not isinstance(streams, list) or len(streams) != 1 or not isinstance(streams[0], dict):
+        raise ValueError("ffprobe 必须返回一个视频流")
+    if not isinstance(packets, list) or len(packets) != expected_count:
+        raise ValueError("ffprobe 包数量与视频帧数不一致")
+    try:
+        time_base = Fraction(streams[0]["time_base"])
+    except (KeyError, TypeError, ValueError, ZeroDivisionError) as error:
+        raise ValueError("ffprobe time_base 无效") from error
+    if time_base <= 0:
+        raise ValueError("ffprobe time_base 必须为正数")
+    pts = []
+    for packet in packets:
+        value = packet.get("pts") if isinstance(packet, dict) else None
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ValueError("ffprobe PTS 必须是非负整数")
+        pts.append(value)
+    pts.sort()
+    if any(current <= previous for previous, current in zip(pts, pts[1:])):
+        raise ValueError("ffprobe PTS 必须严格递增")
+    seconds_per_tick = float(time_base)
+    return np.asarray([(value * seconds_per_tick * 1000.0) / 1000.0 for value in pts], dtype=np.float64)
+
+
+def _ffprobe_timeline(video: Path, expected_count: int) -> np.ndarray | None:
+    executable = shutil.which("ffprobe")
+    if executable is None:
+        LOGGER.warning(
+            "未找到 ffprobe，生产环境请执行 `sudo apt-get install -y ffmpeg`；当前回退到 OpenCV 逐帧扫描"
+        )
+        return None
+    try:
+        completed = subprocess.run(
+            [
+                executable,
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=time_base:packet=pts",
+                "-of",
+                "json",
+                str(video),
+            ],
+            capture_output=True,
+            check=True,
+            text=True,
+            timeout=30,
+        )
+        return _packet_timeline(json.loads(completed.stdout), expected_count)
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError, ValueError) as error:
+        LOGGER.warning("ffprobe 时间轴不可用，回退到 OpenCV 逐帧扫描: %s", error)
+        return None
 
 
 def scan_video(path: str | Path) -> VideoInfo:
@@ -39,12 +105,20 @@ def scan_video(path: str | Path) -> VideoInfo:
         fps = float(capture.get(cv2.CAP_PROP_FPS))
         width = _positive_dimension(capture.get(cv2.CAP_PROP_FRAME_WIDTH), "宽度")
         height = _positive_dimension(capture.get(cv2.CAP_PROP_FRAME_HEIGHT), "高度")
-        reported = []
-        while capture.grab():
-            reported.append(float(capture.get(cv2.CAP_PROP_POS_MSEC)) / 1000.0)
+        reported_count = int(round(capture.get(cv2.CAP_PROP_FRAME_COUNT)))
+        reported = (
+            _ffprobe_timeline(video, reported_count)
+            if reported_count > 0 and capture.getBackendName().upper() == "FFMPEG"
+            else None
+        )
+        if reported is None:
+            values = []
+            while capture.grab():
+                values.append(float(capture.get(cv2.CAP_PROP_POS_MSEC)) / 1000.0)
+            reported = np.asarray(values, dtype=np.float64)
     finally:
         capture.release()
-    if not reported:
+    if len(reported) == 0:
         raise ValueError(f"视频没有可解码帧: {video}")
     if not _positive_finite(fps):
         raise ValueError(f"视频 FPS 必须是有限正数: {fps}")
