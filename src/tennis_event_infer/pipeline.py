@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 import json
 import math
@@ -30,6 +31,20 @@ _MODEL_INPUTS = (
     "patch_quality",
     "patch_quality_continuous",
 )
+
+
+def _prefetch_one(iterable):
+    iterator = iter(iterable)
+    finished = object()
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(next, iterator, finished)
+    try:
+        while (item := future.result()) is not finished:
+            future = executor.submit(next, iterator, finished)
+            yield item
+    finally:
+        future.cancel()
+        executor.shutdown(wait=True, cancel_futures=True)
 
 
 @dataclass(frozen=True)
@@ -151,7 +166,8 @@ def predict_frame_scores(
     try:
         checkpoint.model.eval()
         with torch.inference_mode():
-            for batch in loader:
+            batches = _prefetch_one(loader) if checkpoint.device.type == "cuda" else loader
+            for batch in batches:
                 inputs = {
                     name: batch[name].to(checkpoint.device, non_blocking=checkpoint.device.type == "cuda")
                     for name in _MODEL_INPUTS

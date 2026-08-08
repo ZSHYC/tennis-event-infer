@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import threading
 from types import SimpleNamespace
 
 import cv2
@@ -42,6 +43,30 @@ def test_product_event_scores_are_sigmoid_times_softmax():
         "type_logits": torch.tensor([[0.0, 0.0]]),
     }
     np.testing.assert_allclose(event_scores(output).numpy(), [[0.25, 0.25]])
+
+
+def test_prefetch_one_preserves_order_and_loads_on_background_thread():
+    caller = threading.get_ident()
+    producers = []
+
+    def items():
+        for value in range(3):
+            producers.append(threading.get_ident())
+            yield value
+
+    assert list(pipeline._prefetch_one(items())) == [0, 1, 2]
+    assert producers and set(producers) != {caller}
+
+
+def test_prefetch_one_propagates_producer_failure():
+    def items():
+        yield 1
+        raise RuntimeError("producer failed")
+
+    iterator = pipeline._prefetch_one(items())
+    assert next(iterator) == 1
+    with pytest.raises(RuntimeError, match="producer failed"):
+        next(iterator)
 
 
 def test_nms_is_per_class_and_prefers_higher_score():
